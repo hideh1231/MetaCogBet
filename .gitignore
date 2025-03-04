@@ -1,0 +1,11 @@
+*~
+*.out
+*.Rout
+.DS_Store
+.Rapp.history
+.RData
+.Rhistory
+.Rproj.user/
+.vscode
+renv
+*.asv

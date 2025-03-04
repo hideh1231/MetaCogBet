@@ -1,0 +1,5 @@
+library(jagstargets)
+library(tarchetypes)
+library(here)
+tar_option_set(packages = c("tarchetypes","here","tidyverse","rstatix","rjags","ggpubr","readxl","dlookr","ggrain","patchwork","bayesplot","abind","bayestestR","brms"))
+source("R/functions.R")

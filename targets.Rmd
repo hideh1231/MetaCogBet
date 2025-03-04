@@ -1,0 +1,444 @@
+---
+title: "Targets pipeline"
+author: "Hidekazu Nagamura"
+date: "2023-9-4"
+format: 
+  html:
+    code-fold: true
+---
+
+## Settings
+
+```{r setup}
+library(targets)
+library(jagstargets)
+library(tarchetypes)
+library(tidyverse)
+library(bayesplot)
+library(here)
+library(ggpubr)
+library(ggpp)
+library(ggrain)
+library(ggdist)
+library(see)
+library(patchwork)
+library(abind)
+library(brms)
+library(stats)
+library(rstatix)
+library(mc2d)
+library(parallel)
+library(crew)
+library(ggnewscale)
+library(RColorBrewer)
+source("R/functions.R")
+```
+
+```{targets settings, tar_globals = TRUE, tar_interactive = FALSE}
+library(jagstargets)
+library(tarchetypes)
+library(here)
+tar_option_set(packages = c("tarchetypes","here","tidyverse","rstatix","rjags","ggpubr","readxl","dlookr","ggrain","patchwork","bayesplot","abind","bayestestR","brms"))
+source("R/functions.R")
+```
+
+## Non-interactive mode
+```{r}
+tar_visnetwork()
+```
+
+### make
+```{r}
+tar_option_set(error = "continue", memory = "transient", garbage_collection = TRUE, storage = "worker", retrieval = "worker", format = "qs", controller = crew_controller_local(workers = 30, seconds_idle = 3))
+# tar_watch(seconds = 10, outdated = FALSE, targets_only = TRUE)
+tar_make(seconds_meta_append = 15, seconds_reporter = 5)
+```
+
+## read & preprocess data
+- exclusion
+  - remove only response `nan` or reaction time less than 100 ms
+  - remove participants who fixed any responses in each condition
+  - remove participants who had fewer than 18 trials in each condition
+  
+```{targets preprocess_exp2_revision_241224, tar_interactive = FALSE}
+list(
+  tar_target(data_exp2, get_raw_data_exp2(), deployment = "main"),
+  tar_target(subj_info_exp2, get_subject_info_exp2()),
+  tar_target(preprocess_exp2_revise, 
+             preprocess_data(
+               data_exp2, c("condition","difficulty"),
+               remove_fix_behavior = TRUE, 
+               remove_few_trial_participants = TRUE, 
+               remove_half_accuracy = FALSE,
+               remove_fix_bet_correctness = FALSE, 
+               remove_fix_cnf_correctness = FALSE
+               ))
+)
+```
+
+
+## analysis
+create dataframe in each condition and difficulty
+```{targets analysis_for_revision, tar_interactive = FALSE}
+list(
+  tar_target(
+    dataframe_condition_difficulty_revise,
+    summarise_data(preprocess_exp2_revise |> mutate(bet=bet-1), c("id", "difficulty", "condition"))
+  ),
+  tar_target(
+    dataframe_bet_revise,
+    summarise_data(preprocess_exp2_revise |> mutate(bet=bet-1), c("id", "bet"))
+  )
+)
+```
+
+```{r}
+print_sample_size <- function(dataframe_name) {
+  original_sample_size <- 237
+  tar_load(!!sym(dataframe_name))
+  dataframe <- get(dataframe_name)
+  tar_load(subj_info_exp2)
+
+  subj_data <- dataframe |> select(id, condition) |> unique() |> 
+    left_join(subj_info_exp2, by = "id")
+  
+  sample_size <- subj_data |> nrow()
+  n_bet <- subj_data |> filter(condition == "bet") |> nrow()
+  n_cnf <- subj_data |> filter(condition == "cnf") |> nrow()
+  n_female <- subj_data |> filter(sex == "female") |> nrow()
+  n_male   <- subj_data |> filter(sex == "male")   |> nrow()
+  age_mean <- subj_data |> pull(age) |> mean() |> round(1)
+  age_sd   <- subj_data |> pull(age) |> sd() |> round(1)
+  age_min  <- subj_data |> pull(age) |> min()
+  age_max  <- subj_data |> pull(age) |> max()
+  
+  print(paste0("N = ", sample_size," (",round(sample_size/original_sample_size*100),"% of ", original_sample_size , ")"))
+  print(paste0("Confidence: N = ", n_cnf, "; Bet: N = ", n_bet))
+  print(paste0("female: N = ", n_female, "; male: N = ", n_male))
+  print(paste0("aged ", age_min, "-", age_max, " years"))
+  print(paste0(age_mean, "±", age_sd, " (mean±SD) years"))
+}
+```
+
+### Participant & Table 1
+
+```{r}
+print_sample_size("preprocess_exp2_revise")
+```
+
+```{r}
+basic_analysis_for_revision <- function(dataframe_name, criteria) {
+  tar_load(!!sym(dataframe_name))
+  
+  # arrange dataframe for JASP
+  dataframe <- get(dataframe_name)
+  dataframe |> 
+    pivot_wider(id_cols = c(id, condition), names_from = difficulty, values_from = c(accuracy, bet, cnf, pre_auroc2, post_auroc2, d1, score, bet_rt, ans_rt, cnf_rt)) |> 
+    write_csv(here(paste0("csv/dataframe_condition_difficulty_exp2_",criteria,".csv")))
+  
+  # rename columns for creating figures
+  dataframe <- get(dataframe_name) |> 
+    rename(
+      Difficulty = difficulty, 
+      Group = condition,
+      Accuracy = accuracy,
+      `P(Pre-rating = High)` = bet,
+      `Post-rating` = cnf,
+      `d'` = d1,
+      Score = score
+    ) |> 
+    mutate(
+      Difficulty = factor(if_else(
+        Difficulty == "low",
+        "Easy",
+        "Hard"
+      )),
+      Group = factor(if_else(
+        Group == "bet",
+        "Bet",
+        "Confidence"
+      ), levels = c("Confidence","Bet"))
+    )
+  
+  # plot
+  y <- c("Accuracy","d'","c1","P(Pre-rating = High)","Post-rating","Score","bet_rt","ans_rt","cnf_rt")
+  pos <- position_dodgenudge(width = 0.2, direction = "split.x")
+  for (yy in y) {
+    p <- plot_between_two_condition_for_paper(dataframe, yy, "Group", "Difficulty", c("Confidence", "Bet"))
+    plot(p)
+  
+    ggsave(paste0("figure/pdf/",yy,"_exp2_",criteria,".pdf"), dpi = 600, width = 5, height = 5)
+  }
+  
+  # statistical tests
+  # dataframe |> 
+  #   anova_test(Accuracy ~ Group * Difficulty)
+  # dataframe |> 
+  #   anova_test(`P(Pre-rating = High)` ~ Group * Difficulty)
+  # dataframe |> 
+  #   anova_test(`Post-rating` ~ Group * Difficulty)
+  ## for inter-participant variance
+  dataframe |> 
+    group_by(Difficulty) |>
+    levene_test(`P(Pre-rating = High)` ~ Group) |> 
+    adjust_pvalue()
+}
+```
+
+### Figure 2
+```{r}
+basic_analysis_for_revision("dataframe_condition_difficulty_revise", "revise")
+```
+
+```{r}
+cnf_analysis_by_bet <- function(dataframe_name, criteria) {
+  tar_load(!!sym(dataframe_name))
+  
+  # arrange dataframe for JASP
+  dataframe <- get(dataframe_name)
+  
+  dataframe |> 
+    pivot_wider(id_cols = c(id), names_from = bet, values_from = c(accuracy, cnf, pre_auroc2, post_auroc2, d1, score, bet_rt, ans_rt, cnf_rt)) |> 
+    write_csv(here(paste0("csv/dataframe_bet_",criteria,"_exp2_revise.csv")))
+  
+  dataframe <- dataframe |> 
+    rename(
+      Accuracy = accuracy,
+      `Pre-rating` = bet,
+      `Post-rating` = cnf,
+      `d'` = d1,
+      Score = score
+    ) |> 
+    mutate(
+      `Pre-rating` = factor(if_else(
+        `Pre-rating` == 0,
+        "Low",
+        "High"
+      ), levels = c("Low", "High"))
+    )
+  
+  p <- plot_within_one_condition_for_paper(dataframe, "Post-rating", "Pre-rating")
+  plot(p)
+  
+  ggsave(paste0("figure/pdf/fig4_exp2_",criteria,".pdf"), dpi = 600, width = 5, height = 5)
+  
+}
+```
+
+
+### Figure 4
+```{r}
+cnf_analysis_by_bet("dataframe_bet_revise", "revise")
+```
+
+## calculate meta-d'
+
+### condition x difficulty
+
+two-way mixed ANOVA
+- within: difficulty
+- between: condition
+
+#### pre-M-ratio
+
+```{targets preprocess_metad_pre_between_condition_within_difficulty_exp2_for_revision, tar_interactive = FALSE}
+list(
+  tar_target(
+    preprocess_metad_pre_between_condition_within_difficulty_exp2_revise,
+    preprocess_metad_bet_2way_mixed_anova(preprocess_exp2_revise, c("condition", "difficulty"))
+  )
+)
+```
+
+```{targets metad_pre_between_condition_within_difficulty_exp2_for_revision, tar_interactive = FALSE}
+list(
+  tar_jags(
+    hmetad_pre_between_condition_within_difficulty_exp2_revise,
+    jags_files = "jags/Bayes_metad_2way_mixed_ANOVA.txt",
+    parameters.to.save = c("muBd_Condition", "lamBd_Condition", "sigD_Condition", "muBd_Condition_prior",
+                           "muBd_interaction", "lamBd_interaction", "sigD_interaction", "muBd_interaction_prior",
+                           "mu_beta1", "mu_beta1_prior",
+                           "Mratio","logMratio","muD","mu_c2","mu_regression",
+                           "Bd_Condition","Bd_interaction", "beta1","mu","d1","c1"),
+    data = preprocess_metad_pre_between_condition_within_difficulty_exp2_revise,
+    n.cluster = 3,
+    n.chains = 3,
+    n.iter = 10000,
+    n.burnin = 1000,
+    n.thin = 1,
+    refresh = 200,
+    error = "continue", 
+    progress.bar = "gui"
+  )
+)
+```
+
+#### post-M-ratio
+
+```{targets preprocess_metad_between_condition_within_difficulty_exp2_for_revision, tar_interactive = FALSE}
+list(
+  tar_target(
+    preprocess_metad_between_condition_within_difficulty_exp2_revise,
+    preprocess_metad_2way_mixed_anova(preprocess_exp2_revise, c("condition", "difficulty"))
+  )
+)
+```
+
+```{targets metad_between_condition_within_difficulty_exp2_for_revision, tar_interactive = FALSE}
+list(
+  tar_jags(
+    hmetad_between_condition_within_difficulty_exp2_revise,
+    jags_files = "jags/Bayes_metad_2way_mixed_ANOVA.txt",
+    parameters.to.save = c("muBd_Condition", "lamBd_Condition", "sigD_Condition", "muBd_Condition_prior",
+                           "muBd_interaction", "lamBd_interaction", "sigD_interaction", "muBd_interaction_prior",
+                           "mu_beta1", "mu_beta1_prior",
+                           "Mratio","logMratio","muD","mu_c2","mu_regression",
+                           "Bd_Condition","Bd_interaction", "beta1","mu","d1","c1"),
+    data = preprocess_metad_between_condition_within_difficulty_exp2_revise,
+    n.cluster = 3,
+    n.chains = 3,
+    n.iter = 10000,
+    n.burnin = 1000,
+    n.thin = 1,
+    refresh = 200,
+    error = "continue", 
+    progress.bar = "gui"
+  )
+)
+```
+
+### plot mcmc
+```{r}
+plot_mcmc <- function(summary_name, draws_name, parameter_list) {
+  tar_load(summary_name)
+  tar_load(draws_name)
+  summary <- get(summary_name)
+  draws <- get(draws_name)
+  
+  check_mcmc(summary, draws, parameter_list)
+  # view(summary)
+  print(paste0("Instruction: pd = ",   calculate_pd(draws, "mu_beta1", F)))
+  print(paste0("Difficulty: pd = ",  calculate_pd(draws, "muBd_Condition", F)))
+  print(paste0("Interaction: pd = ", calculate_pd(draws, "muBd_interaction", F)))
+  
+  print(summary |> filter(variable %in% parameter_list))
+}
+```
+
+#### Table 3, pd (probability of direction)
+```{r}
+parameter_list_2way_mixed_anova <- c(
+  # group parameters
+  "muBd_Condition", "lamBd_Condition", "sigD_Condition", # Condition = difficulty
+  "muD", "mu_c2","mu_beta1","muBd_interaction" # beta1 = instruction
+)
+
+plot_mcmc("hmetad_pre_between_condition_within_difficulty_exp2_revise_summary_Bayes_metad_2way_mixed_ANOVA", 
+          "hmetad_pre_between_condition_within_difficulty_exp2_revise_draws_Bayes_metad_2way_mixed_ANOVA", 
+          parameter_list_2way_mixed_anova)
+
+plot_mcmc("hmetad_between_condition_within_difficulty_exp2_revise_summary_Bayes_metad_2way_mixed_ANOVA", 
+          "hmetad_between_condition_within_difficulty_exp2_revise_draws_Bayes_metad_2way_mixed_ANOVA", 
+          parameter_list_2way_mixed_anova)
+```
+
+### plot 95% HDI
+```{r}
+plot_95pt_ci <- function(draws_name, order, criteria) {
+  tar_load(draws_name)
+  draws <- get(draws_name) %>%
+      select(
+        all_of(starts_with("mu"))
+      ) |> 
+    rename(
+      Interaction = muBd_interaction,
+      Instruction = mu_beta1,
+      Difficulty = muBd_Condition,
+    )
+  pars <- c("Instruction","Difficulty","Interaction")
+  mcmc_intervals_data(
+    draws, 
+    pars = pars, 
+    prob = 0.9,
+    prob_outer = 0.95
+  ) |> print()
+  color_scheme_set("gray")
+  p <- mcmc_areas(
+    draws,
+    pars = pars,
+    prob = 0.95,
+    border_size = 2,
+  ) + xlab("Parameter value") + ylab("Parameters") + theme_pubr(base_size = 24)
+  plot(p)
+  ggsave(paste0("figure/pdf/posterior_dist_",order,"_exp2_",criteria,".pdf"), dpi = 600, width = 8, height = 5)
+
+}
+```
+
+#### Figure 3 left, Table 3
+```{r}
+plot_95pt_ci("hmetad_pre_between_condition_within_difficulty_exp2_revise_draws_Bayes_metad_2way_mixed_ANOVA", "pre", "revise")
+plot_95pt_ci("hmetad_between_condition_within_difficulty_exp2_revise_draws_Bayes_metad_2way_mixed_ANOVA", "post", "revise")
+```
+
+### plot individuals
+```{r}
+plot_individual_metad <- function(summary_name, data_name, order, criteria) {
+  tar_load(summary_name)
+  tar_load(data_name)
+  summary <- get(summary_name)
+  data <- get(data_name)
+  
+  indiv_draws <- summary %>%
+    separate(variable, into = c("name", "idx"), sep = "\\[") %>%
+    separate(idx, into = c("id", "difficulty"), sep = ",") %>%
+    mutate(
+      difficulty = as.numeric(str_sub(difficulty, end = -2)),
+    ) %>%
+    drop_na(id,difficulty) %>%
+    group_by(name,difficulty) %>%
+    mutate(
+      condition = data$cov,
+      condition = if_else(condition == 0, "bet", "cnf")
+    ) %>%
+    ungroup() %>%
+    mutate(
+      difficulty = if_else(
+        difficulty %% 2 == 0,
+        "low",
+        "high"
+      )
+    ) %>%
+    select(name, id, condition, difficulty, mean) %>%
+    pivot_wider(names_from = name, values_from = mean) %>%
+    # mutate(Mratio = remove_outliers(Mratio)) %>%
+    mutate(logMratio = ifelse(logMratio<10 & logMratio > -100, logMratio, NA)) %>%
+    rename(`log(Pre-M-ratio)` = logMratio, Difficulty = difficulty, Instruction = condition) %>%
+    mutate(
+      Difficulty = factor(if_else(
+        Difficulty == "low",
+        "Easy",
+        "Hard"
+      )),
+      Instruction = factor(if_else(
+        Instruction == "bet",
+        "Bet",
+        "Confidence"), levels = c("Confidence", "Bet"))
+    )
+  
+  p <- plot_between_two_condition_for_paper(indiv_draws, "log(Pre-M-ratio)", "Instruction", "Difficulty", c("Confidence", "Bet"))
+  plot(p)
+  
+  ggsave(paste0("figure/pdf/",order,"_logMratio_exp2_",criteria,".pdf"), dpi = 600, width = 5, height = 5)
+}
+```
+
+#### Figure 3 right
+```{r}
+plot_individual_metad("hmetad_pre_between_condition_within_difficulty_exp2_revise_summary_Bayes_metad_2way_mixed_ANOVA", 
+                      "hmetad_pre_between_condition_within_difficulty_exp2_revise_data", 
+                      "pre", "revise")
+plot_individual_metad("hmetad_between_condition_within_difficulty_exp2_revise_summary_Bayes_metad_2way_mixed_ANOVA", 
+                      "hmetad_between_condition_within_difficulty_exp2_revise_data", 
+                      "post", "revise")
+```
